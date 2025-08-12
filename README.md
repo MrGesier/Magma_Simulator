@@ -1,4 +1,4 @@
-readme = """\
+
 # MGTN$ Economy Calibrator
 
 Interactive Streamlit app to calibrate the MGTN$ economy:
