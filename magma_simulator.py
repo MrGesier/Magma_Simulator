@@ -1,5 +1,6 @@
-# app_v4.py — MGTN$ Economy Calibrator (v4: price dynamics + cadence)
-# Run with: streamlit run app_v4.py
+
+# app_v6.py — MGTN$ Economy Calibrator (v6: stem() fix + full tooltips)
+# Run with: streamlit run app_v6.py
 
 import math
 import json
@@ -8,7 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-st.set_page_config(page_title="MGTN$ Economy Calibrator v4", layout="wide")
+st.set_page_config(page_title="MGTN$ Economy Calibrator v6", layout="wide")
 
 # ============================ Helpers ============================
 
@@ -100,7 +101,7 @@ def ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct):
         raw = np.power(mids, -a)
         w = raw / raw.sum()
         dollars = w * total_at_2pct
-        cum = lambda thr: dollars[mids <= thr].sum()
+        def cum(thr): return dollars[mids <= thr].sum()
         err = (cum(0.5) - targets[0.5])**2 + (cum(1.0) - targets[1.0])**2
         if best_err is None or err < best_err:
             best_err, best_alpha = err, a
@@ -126,69 +127,126 @@ def monthly_from_daily(series_daily, months, days_per_month=30, how="sum"):
         ptr += days_per_month
     return np.array(out)
 
-# ============================ Sidebar ============================
+# ============================ Sidebar (with tooltips) ============================
 
-st.title("MGTN$ Economy Calibrator — v4")
-st.caption("Adds price dynamics, price-aware buybacks, and price-aware DAO cap with configurable cadence.")
+st.title("MGTN$ Economy Calibrator — v6")
+st.caption("Adds price dynamics, price-aware buybacks, and price-aware DAO cap. Hover the (?) next to inputs for help.")
 
 st.sidebar.header("Global Inputs")
 
+
 # Pools
-primary_pool = st.sidebar.number_input("Primary Pool size (MGTN$)", value=10_000_000_000, step=100_000_000)
-reward_pool  = st.sidebar.number_input("Reward Pool size (MGTN$)",  value=3_000_000_000, step=50_000_000)
+primary_pool = st.sidebar.number_input(
+    "Primary Pool size (MGTN$)",
+    value=10_000_000_000, step=100_000_000,
+    help="Supply available for MRT$→MGTN$ conversions (primary swap / bonding curve)."
+)
+reward_pool  = st.sidebar.number_input(
+    "Reward Pool size (MGTN$)",
+    value=3_000_000_000, step=50_000_000,
+    help="Pool distributed to holders as Inflationary Rewards (IR). Depletes per emission schedule; replenished by buybacks."
+)
 
 # Price model
 st.sidebar.markdown("---")
 st.sidebar.subheader("MGTN$ Price Model (GBM)")
-p0 = st.sidebar.number_input("Initial price (USD/MGTN$)", value=1.00, step=0.05, format="%.2f")
-mu = st.sidebar.slider("Annual drift μ (%)", -50, 50, 0, step=1) / 100.0
-sigma = st.sidebar.slider("Annual volatility σ (%)", 1, 200, 60, step=1) / 100.0
-price_seed = st.sidebar.number_input("Random seed", value=42, step=1)
+p0 = st.sidebar.number_input("Initial price (USD/MGTN$)", value=1.00, step=0.05, format="%.2f",
+                             help="Starting price used for the simulated path.")
+mu = st.sidebar.slider("Annual drift μ (%)", -50, 50, 0, step=1,
+                       help="Expected annualized return of price.") / 100.0
+sigma = st.sidebar.slider("Annual volatility σ (%)", 1, 200, 60, step=1,
+                          help="Annualized volatility of price." ) / 100.0
+price_seed = st.sidebar.number_input("Random seed", value=42, step=1,
+                                     help="Seed for reproducible price paths.")
 
 # Revenue sharing / buybacks
 st.sidebar.markdown("---")
 st.sidebar.subheader("Revenue Sharing → Buybacks")
-buyback_pct = st.sidebar.slider("Buyback rate (% of revenues)", 0, 50, 5) / 100.0
-buyback_cadence = st.sidebar.slider("Buyback cadence (days)", 1, 90, 30, step=1)
-price_ref_for_cap = st.sidebar.selectbox("Price reference for DAO cap", ["EMA14d price", "Last price"], index=0)
+buyback_pct = st.sidebar.slider("Buyback rate (% of revenues)", 0, 50, 5,
+                                help="Share of monthly JV revenues converted to MGTN$ by the MM.") / 100.0
+buyback_cadence = st.sidebar.slider("Buyback cadence (days)", 1, 90, 30, step=1,
+                                    help="How often the MM executes buybacks. USD accrues daily and is converted to tokens at the execution price.")
+price_ref_for_cap = st.sidebar.selectbox("Price reference for DAO cap", ["EMA14d price", "Last price"], index=0,
+                                         help="Which price series is used to translate USD depth into a per-user cap in MRT$." )
 
 # Emissions
 st.sidebar.markdown("---")
 st.sidebar.subheader("Reward Emissions")
-r0 = st.sidebar.slider("Initial annual emission rate (%)", 1, 40, 15) / 100.0
-rf = st.sidebar.slider("Final annual emission rate (%) by Year 15", 0, 10, 2) / 100.0
-half_life = st.sidebar.slider("Target half-life (years)", 1, 10, 6)
-horizon_years = st.sidebar.slider("Horizon (years) for reward simulation", 5, 20, 15)
+r0 = st.sidebar.slider("Initial annual emission rate (%)", 1, 40, 15,
+                       help="Starting annual emission rate from the Reward Pool (year 1).") / 100.0
+rf = st.sidebar.slider("Final annual emission rate (%) by Year 15", 0, 10, 2,
+                       help="Asymptotic annual emission rate by the end of the horizon.") / 100.0
+half_life = st.sidebar.slider("Target half-life (years)", 1, 10, 6,
+                              help="Time for the Reward Pool to fall to 50% with zero buybacks.")
+horizon_years = st.sidebar.slider("Horizon (years) for reward simulation", 5, 20, 15,
+                                  help="Simulation horizon for pool depletion and buybacks.")
 
 # Kaiko depth model
 st.sidebar.markdown("---")
 st.sidebar.subheader("Market Depth Model (Kaiko)")
-k_ratio = st.sidebar.number_input("k (scaling)", value=1450, step=50)
-beta = st.sidebar.slider("β (sublinear exponent)", 0.1, 1.0, 0.6, 0.05)
-users_per_building = st.sidebar.slider("Users per building", 1, 10, 3)
-max_buildings = st.sidebar.slider("Max buildings (x-axis range)", 100, 20000, 5000, step=100)
+k_ratio = st.sidebar.number_input("k (scaling)", value=1450, step=50,
+                                  help="Scaling factor for depth: D₂%(u) = k × u^β (USD at ±2%).")
+beta = st.sidebar.slider("β (sublinear exponent)", 0.1, 1.0, 0.6, 0.05,
+                         help="Sublinear exponent for depth growth vs. users.")
+users_per_building = st.sidebar.slider("Users per building", 1, 10, 3,
+                                       help="Map buildings to users: users = buildings × this value.")
+max_buildings = st.sidebar.slider("Max buildings (x-axis range)", 100, 20000, 5000, step=100,
+                                  help="Upper x-axis bound for buildings plots.")
 
 # Tier ratios
-st.sidebar.caption("Tier-1 cumulative depth targets (% of per-CEX allocation)")
-d05 = st.sidebar.number_input("±0.5% depth (%)", value=4.0, step=0.5) / 100.0
-d10 = st.sidebar.number_input("±1.0% depth (%)", value=12.0, step=0.5) / 100.0
-d20 = st.sidebar.number_input("±2.0% depth (%)", value=36.0, step=0.5) / 100.0
-cap_threshold = st.sidebar.radio("Cap is tied to which depth?", ["±1.0%", "±2.0%"], index=0)
+st.sidebar.caption("Tier‑1 cumulative depth targets (% of per‑CEX allocation)")
+d05 = st.sidebar.number_input("±0.5% depth (%)", value=4.0, step=0.5,
+                              help="Cumulative depth within ±0.5% of mid, as % of per‑CEX allocation.") / 100.0
+d10 = st.sidebar.number_input("±1.0% depth (%)", value=12.0, step=0.5,
+                              help="Cumulative depth within ±1.0% of mid, as % of per‑CEX allocation.") / 100.0
+d20 = st.sidebar.number_input("±2.0% depth (%)", value=36.0, step=0.5,
+                              help="Cumulative depth within ±2.0% of mid, as % of per‑CEX allocation.") / 100.0
+cap_threshold = st.sidebar.radio("Cap is tied to which depth?", ["±1.0%", "±2.0%"], index=0,
+                                 help="Choose which depth threshold the DAO cap enforces against.")
 ratio_choice = "1.0" if cap_threshold == "±1.0%" else "2.0"
 
 # DAO policy
 st.sidebar.markdown("---")
 st.sidebar.subheader("DAO Cap Policy")
-cadence = st.sidebar.slider("Governance cadence (days)", 7, 60, 14, step=1)
-trigger = st.sidebar.slider("EMA trigger threshold (%)", 1, 25, 5, step=1) / 100.0
-max_step = st.sidebar.slider("Max cap step per decision (%)", 1, 50, 10, step=1) / 100.0
-cap_floor = st.sidebar.number_input("Cap floor (MRT$ per user)", value=5.0, step=1.0)
-cap_ceil = st.sidebar.number_input("Cap ceiling (MRT$ per user)", value=60.0, step=5.0)
+cadence = st.sidebar.slider("Governance cadence (days)", 7, 60, 14, step=1,
+                            help="How often the DAO can update the cap per user.")
+trigger = st.sidebar.slider("EMA trigger threshold (%)", 1, 25, 5, step=1,
+                            help="Minimum change vs last anchor to trigger an update.") / 100.0
+max_step = st.sidebar.slider("Max cap step per decision (%)", 1, 50, 10, step=1,
+                             help="At each decision, the cap can move by at most this percent of its current value.") / 100.0
+cap_floor = st.sidebar.number_input("Cap floor (MRT$ per user)", value=5.0, step=1.0,
+                                    help="Lower bound for the per‑user cap (prevents near‑zero caps)." )
+cap_ceil = st.sidebar.number_input("Cap ceiling (MRT$ per user)", value=60.0, step=5.0,
+                                   help="Upper bound for the per‑user cap (prevents oversized caps)." )
+
+# MM & CEX ladder
+st.sidebar.markdown("---")
+st.sidebar.subheader("MM Loan & CEX split")
+loan_amount = st.sidebar.number_input("MM loan amount (USD)", value=3_000_000, step=100_000,
+                                      help="USD loan deployed by MM across CEXs to meet depth targets.")
+st.sidebar.caption("Weights (auto‑normalized)")
+w_binance = st.sidebar.slider("Binance weight", 0.0, 1.0, 0.40, 0.05, help="Share of MM loan allocated to Binance.")
+w_okx     = st.sidebar.slider("OKX weight",     0.0, 1.0, 0.25, 0.05, help="Share of MM loan allocated to OKX.")
+w_coin    = st.sidebar.slider("Coinbase weight",0.0, 1.0, 0.20, 0.05, help="Share of MM loan allocated to Coinbase.")
+w_bybit   = st.sidebar.slider("Bybit weight",   0.0, 1.0, 0.15, 0.05, help="Share of MM loan allocated to Bybit.")
+
+# Ladder
+st.sidebar.subheader("Power‑law Ladder (Tier‑1)")
+n_slices = st.sidebar.slider("Number of slices", 10, 60, 30, step=5, help="Number of depth buckets from min to max depth.")
+depth_min = st.sidebar.number_input("Min depth (%)", value=0.05, help="Lower bound of ladder quoting range (from mid)." )
+depth_max = st.sidebar.number_input("Max depth (%)", value=2.0,  help="Upper bound of ladder quoting range (from mid)." )
+
+# ---------------------------- Navigation ----------------------------
+page = st.radio(
+    "Navigation",
+    ["Dashboard", "Price & Buybacks", "Revenues & Reward Pool", "DAO Cap Impact", "Depth vs Buildings", "MM & Ladder", "Downloads"],
+    horizontal=True,
+    help="Switch between analysis pages."
+)
 
 # ============================ Revenues Input ============================
-
 st.markdown("### Revenues (editable)")
-st.caption("Annual USD revenues by region (2026–2030). Evenly distributed per month; extended at Year-5 monthly level thereafter.")
+st.caption("Annual USD revenues by region (2026–2030). Evenly distributed per month; extended at Year‑5 level thereafter.")
 default_rev = pd.DataFrame({
     "Region": ["EU", "USA", "UAE"],
     "2026": [936_616, 1_023_689, 1_261_364],
@@ -201,19 +259,19 @@ rev_df = st.data_editor(default_rev, num_rows="dynamic", use_container_width=Tru
 years_cols = [c for c in rev_df.columns if c != "Region"]
 annual_totals = rev_df[years_cols].sum().to_numpy()
 monthly_rev_5y = np.repeat(annual_totals / 12.0, 12)  # 60 months
-months_total = horizon_years * 12
+months_total = st.sidebar.slider("Horizon (months)", 12, 240, int(15*12), step=12,
+                                 help="Total simulation horizon in months.")
 steady = monthly_rev_5y[-1] if len(monthly_rev_5y) else 0.0
 monthly_revenue_series = np.concatenate([monthly_rev_5y, np.full(max(0, months_total - len(monthly_rev_5y)), steady)])
 
 # ============================ Price & Buybacks (Daily) ============================
-
 days_per_month = 30
 days = months_total * days_per_month
 price_path = gbm_price_path(days, p0=p0, mu=mu, sigma=sigma, seed=price_seed)
-price_ema = ema(price_path, span=14)  # 14-day EMA
+price_ema = ema(price_path, span=14)  # 14‑day EMA
 price_ref_series = price_ema if price_ref_for_cap == "EMA14d price" else price_path
 
-# Build daily buyback USD stream and convert to tokens on chosen cadence
+# Daily buyback USD stream → tokens at cadence
 daily_usd_rev = np.repeat(monthly_revenue_series / days_per_month, days_per_month)
 daily_buyback_accum = 0.0
 daily_token_inj = np.zeros(days)
@@ -221,7 +279,6 @@ for t in range(days):
     daily_usd = daily_usd_rev[t] * buyback_pct
     daily_buyback_accum += daily_usd
     if t % buyback_cadence == 0:
-        # Execute buyback: convert accumulated USD at today's price
         tokens = daily_buyback_accum / max(price_path[t], 1e-9)
         daily_token_inj[t] += tokens
         daily_buyback_accum = 0.0
@@ -229,18 +286,16 @@ for t in range(days):
 if daily_buyback_accum > 0:
     daily_token_inj[-1] += daily_buyback_accum / max(price_path[-1], 1e-9)
 
-# Convert to monthly token injections (sum of daily tokens within each month)
+# Monthly token injections (sum daily within month)
 monthly_injection_tokens = monthly_from_daily(daily_token_inj, months_total, days_per_month=days_per_month, how="sum")
 
-# ============================ Reward Pool Simulation (Monthly) ============================
 
+# ============================ Reward Pool Simulation (Monthly) ============================
 monthly_rate, annual_rate = build_emission_schedule(months_total, r0=r0, rf=rf, half_life_years=half_life)
 bal_with_rev = simulate_pool(reward_pool, monthly_rate, monthly_injection_tokens)
 bal_no_rev   = simulate_pool(reward_pool, monthly_rate, np.zeros_like(monthly_injection_tokens))
 
 # ============================ DAO Cap Impact with Price (Daily) ============================
-
-# Daily depth using Kaiko based on buildings/users growth
 b_series = np.linspace(max_buildings * 0.2, max_buildings * 0.6, days)
 u_series = b_series * users_per_building
 d2_daily = kaiko_depth(u_series, k_ratio, beta)
@@ -248,7 +303,6 @@ r10 = d10 / d20
 depth_target_daily = d2_daily * (r10 if ratio_choice == "1.0" else 1.0)
 depth_ema_daily = ema(depth_target_daily, span=14)
 
-# Per-user instantaneous cap in MRT$ derived from depth and price reference
 cap_target_per_user = cap_per_user_from_depth(depth_ema_daily, u_series, price_ref_series, cap_floor, cap_ceil)
 cap_per_user_policy = dao_cap_policy_from_series(
     cap_target_per_user, cadence_days=cadence, trigger_pct=trigger,
@@ -256,30 +310,28 @@ cap_per_user_policy = dao_cap_policy_from_series(
 )
 allowed_total_usd = cap_per_user_policy * u_series * price_ref_series  # max aggregate in USD at the cap
 
-# ============================ UI Pages ============================
 
-page = st.radio(
-    "Navigation",
-    ["Dashboard", "Price & Buybacks", "Revenues & Reward Pool", "DAO Cap Impact", "Depth vs Buildings", "MM & Ladder", "Downloads"],
-    horizontal=True
-)
-
+# ============================ Pages ============================
 if page == "Dashboard":
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Primary Pool (MGTN$)", f"{primary_pool:,.0f}")
     col2.metric("Reward Pool (MGTN$)", f"{reward_pool:,.0f}")
-    col3.metric("Buyback rate", f"{int(buyback_pct*100)}%")
-    col4.metric("Half-life target", f"{half_life} years")
+    col3.metric("Buyback rate", f"{int(buyback_pct*100)}%" )
+    col4.metric("Half-life target", f"{half_life} years" )
 
     t_years = np.arange(months_total) / 12.0
-    st.markdown("#### Reward Pool Depletion (Price-aware buybacks)")
+    st.markdown("#### Reward Pool Depletion (Price‑aware buybacks)")
+    with st.expander("What am I looking at?"):
+        st.write("Balance of the Reward Pool with (solid) and without (dashed) buybacks. Emission schedule scaled to hit the chosen half‑life.")
     fig, ax = plt.subplots(figsize=(8, 3.5))
     ax.plot(t_years, bal_no_rev / 1e9, "--", label="No revenue sharing")
-    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}%")
+    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}%" )
     ax.set_xlabel("Years"); ax.set_ylabel("Pool Balance (B MGTN$)"); ax.grid(alpha=0.2); ax.legend(loc="upper right")
     st.pyplot(fig, clear_figure=True)
 
-    st.markdown("#### DAO Cap vs Depth Headroom (Price-aware)")
+    st.markdown("#### DAO Cap vs Depth Headroom (Price‑aware)")
+    with st.expander("What does the DAO cap change?"):
+        st.write("Per‑user cap is depth / (users × price). The DAO updates it infrequently (cadence/trigger/step), and floor/ceiling limit extremes.")
     breach_days = int((depth_ema_daily - allowed_total_usd < 0).sum())
     colA, colB, colC = st.columns(3)
     colA.metric("Current price (USD)", f"{price_path[-1]:.3f}")
@@ -296,6 +348,8 @@ if page == "Dashboard":
 
 elif page == "Price & Buybacks":
     st.subheader("Price Path (GBM) and Buyback Cadence")
+    with st.expander("What am I looking at?"):
+        st.write("Daily price (GBM) with EMA14d overlay. Change drift μ, volatility σ, seed, and cadence to see the impact on token injections.")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(price_path, label="Price (daily)")
     ax.plot(price_ema, label="Price EMA14d")
@@ -303,16 +357,20 @@ elif page == "Price & Buybacks":
     st.pyplot(fig, clear_figure=True)
 
     st.markdown("**Token injections from buybacks (executed at cadence days)**")
+    with st.expander("What is this bar plot?"):
+        st.write("Bars show the number of tokens injected on each execution day. USD accumulated since the last execution is converted at that day's price.")
     days_axis = np.arange(days)
     fig2, ax = plt.subplots(figsize=(10, 3.5))
-    ax.stem(days_axis, daily_token_inj, use_line_collection=True, label="Token injection (daily)")
+    # Use a version-agnostic bar plot instead of stem() to avoid mpl API differences
+    inj_mask = daily_token_inj > 0
+    ax.bar(days_axis[inj_mask], daily_token_inj[inj_mask], width=1.0, label="Token injection (on execution days)")
     ax.set_xlabel("Day"); ax.set_ylabel("Tokens injected (MGTN$)"); ax.grid(alpha=0.2); ax.legend()
     st.pyplot(fig2, clear_figure=True)
 
-    st.caption("USD accumulates daily from revenues × buyback%. On cadence days, the MM converts the accumulated USD to tokens at the prevailing price, then reinjects into the Reward Pool.")
-
 elif page == "Revenues & Reward Pool":
     st.subheader("Monthly Revenues by Region (USD) & Cumulative")
+    with st.expander("What am I looking at?"):
+        st.write("Editable monthly revenue paths by region (flat within each year), plus cumulative. Drives buyback injections.")
     month_axis_5y = np.arange(len(np.repeat(annual_totals / 12.0, 12)))
     fig, ax = plt.subplots(figsize=(9, 4))
     for idx, row in rev_df.iterrows():
@@ -327,9 +385,11 @@ elif page == "Revenues & Reward Pool":
 
     t_years = np.arange(months_total) / 12.0
     st.subheader("Reward Pool Depletion (with/without buybacks)")
+    with st.expander("What am I looking at?"):
+        st.write("Reward Pool balance with and without buybacks. Right axis shows the annual emission rate used.")
     fig2, ax = plt.subplots(figsize=(9, 4))
     ax.plot(t_years, bal_no_rev / 1e9, "--", label="No revenue sharing")
-    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}% (price-aware)")
+    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}% (price‑aware)")
     ax.set_xlabel("Years"); ax.set_ylabel("Pool Balance (B MGTN$)"); ax.grid(alpha=0.2); ax.legend(loc="upper right")
     ax2 = ax.twinx()
     ax2.plot(t_years, (annual_rate * 100)[:len(t_years)], alpha=0.5, label="Annual emission rate")
@@ -338,7 +398,7 @@ elif page == "Revenues & Reward Pool":
 
 elif page == "DAO Cap Impact":
     st.subheader("How the DAO Cap Uses Price")
-    st.write("Per-user cap = depth target (USD) / (users × price reference). DAO cadence/trigger/step + floor/ceiling produce the stepwise policy.")
+    st.caption("Per‑user cap = depth target (USD) / (users × price reference). DAO cadence/trigger/step + floor/ceiling produce the stepwise policy.")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(cap_target_per_user, label="Instant target cap (MRT$/user)")
     ax.step(np.arange(days), cap_per_user_policy, where="post", label="DAO cap policy (MRT$/user)")
@@ -355,6 +415,8 @@ elif page == "DAO Cap Impact":
 
 elif page == "Depth vs Buildings":
     st.subheader("Depth Curves vs Buildings (monthly view)")
+    with st.expander("What am I looking at?"):
+        st.write("Kaiko depth curves (±0.5/1/2%) vs buildings.")
     b = np.linspace(1, max_buildings, 200)
     u = b * users_per_building
     d2 = kaiko_depth(u, k_ratio, beta)
@@ -369,11 +431,10 @@ elif page == "Depth vs Buildings":
 
 elif page == "MM & Ladder":
     st.subheader("MM Loan Split across CEXs")
+    with st.expander("What am I looking at?"):
+        st.write("Loan allocation across CEXs; used to compute per‑exchange depth targets and ladder calibration.")
     names = ["Binance", "OKX", "Coinbase", "Bybit"]
-    weights = normalize_weights([0.40, 0.25, 0.20, 0.15])  # defaults; feel free to replace with sidebar if needed
-    # If you want live weights, replace the line above by:
-    # weights = normalize_weights([w_binance, w_okx, w_coin, w_bybit])
-    loan_amount = 3_000_000
+    weights = normalize_weights([w_binance, w_okx, w_coin, w_bybit])
     alloc = [loan_amount * w for w in weights]
     fig5, ax = plt.subplots(figsize=(9, 3.5))
     ax.bar(names, alloc)
@@ -382,9 +443,9 @@ elif page == "MM & Ladder":
     ax.set_ylabel("USD allocated"); ax.grid(axis="y", alpha=0.2)
     st.pyplot(fig5, clear_figure=True)
 
-    st.subheader("Power-law Ladder Calibration (Tier-1)")
-    d05, d10, d20 = 0.04, 0.12, 0.36
-    depth_min, depth_max, n_slices = 0.05, 2.0, 30
+    st.subheader("Power‑law Ladder Calibration (Tier‑1)")
+    with st.expander("What am I looking at?"):
+        st.write("USD per slice allocated across depth buckets such that cumulative depth matches Tier‑1 targets at ±0.5% and ±1.0%." )
     per_cex_alloc = alloc[0]
     targets = {0.5: d05 * per_cex_alloc, 1.0: d10 * per_cex_alloc, 2.0: d20 * per_cex_alloc}
     alpha = ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct=targets[2.0])
@@ -413,6 +474,16 @@ elif page == "MM & Ladder":
 
 elif page == "Downloads":
     st.subheader("Downloads")
+    # Recompute weights and ladder parameters here so this page works even if MM & Ladder wasn't visited
+    names = ["Binance", "OKX", "Coinbase", "Bybit"]
+    weights = normalize_weights([w_binance, w_okx, w_coin, w_bybit])
+    per_cex_alloc = (loan_amount * weights[0]) if len(weights) else 0.0
+    try:
+        targets = {0.5: d05 * per_cex_alloc, 1.0: d10 * per_cex_alloc, 2.0: d20 * per_cex_alloc}
+        alpha = ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct=targets[2.0]) if per_cex_alloc>0 else None
+    except Exception:
+        alpha = None
+
     out_rev = pd.DataFrame({"Month": np.arange(len(monthly_revenue_series)) + 1,
                             "Monthly_Revenue_USD": monthly_revenue_series})
     st.download_button("Download monthly revenues CSV",
@@ -425,11 +496,14 @@ elif page == "Downloads":
         "price": {"p0": p0, "mu": mu, "sigma": sigma, "seed": price_seed,
                   "price_ref_for_cap": price_ref_for_cap, "buyback_cadence_days": buyback_cadence},
         "buyback_pct": buyback_pct,
-        "emissions": {"r0": r0, "rf": rf, "half_life": half_life, "horizon_years": horizon_years},
+        "emissions": {"r0": r0, "rf": rf, "half_life": half_life, "horizon_months": months_total},
         "kaiko": {"k_ratio": k_ratio, "beta": beta, "users_per_building": users_per_building},
         "tier1_ratios": {"0.5%": d05, "1.0%": d10, "2.0%": d20, "cap_threshold": cap_threshold},
         "dao_policy": {"cadence_days": cadence, "trigger_pct": trigger,
                        "max_step_pct": max_step, "cap_floor": cap_floor, "cap_ceil": cap_ceil},
+        "mm": {"loan_amount": loan_amount,
+               "cex_weights": dict(zip(names, weights)),
+               "ladder": {"n_slices": int(n_slices), "depth_min": depth_min, "depth_max": depth_max, "alpha": float(alpha) if alpha is not None else None}}
     }
     st.download_button("Download current parameters (JSON)",
                        data=json.dumps(out_params, indent=2),
