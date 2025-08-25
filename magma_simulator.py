@@ -1,533 +1,576 @@
-# app_v7.py — MGTN$ Economy Calibrator (15y yield policy; reorganized inputs + tooltips)
-# Run: streamlit run app_v7.py
+# app_magma_flowdesk_buyback_split.py
+# Run: streamlit run app_magma_flowdesk_buyback_split.py
 
-import math
-import json
+import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import streamlit as st
+from scipy.ndimage import uniform_filter1d
 
-st.set_page_config(page_title="MGTN$ Economy Calibrator v7", layout="wide")
+# --- compatibility for older Streamlit (column_config may not exist) -----------
+try:
+    from streamlit import column_config as cc
+    _HAS_COLCONF = True
+except Exception:
+    _HAS_COLCONF = False
 
-# ============================ Helpers ============================
+st.set_page_config(page_title="Magma — Overflow + Buybacks (split absorption)", layout="wide")
+st.title("Unlock → Absorption (Dyn. Liquidity vs Buybacks) → Overflow Impact on Price")
 
-def kaiko_depth(users, k, beta):
-    users = np.asarray(users, dtype=float)
-    return k * np.power(np.maximum(users, 1.0), beta)
+DT = 1/365.0
+N  = 100  # Monte Carlo sims (median price)
 
-def cap_per_user_from_depth(depth_usd, users, price_ref, floor, ceil):
-    """Return cap per user in MRT$, given depth in USD, users, and a price reference."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        cap = np.where(users > 0, depth_usd / (users * np.maximum(price_ref, 1e-9)), 0.0)
-    return np.clip(cap, floor, ceil)
+# ===================== Sidebar: Core ===========================================
+st.sidebar.header("Core")
+TOTAL_SUPPLY  = st.sidebar.number_input(
+    "Total Supply (tokens)", value=1_000_000_000, step=100_000_000,
+    help="Offre totale de tokens (ex. 1, 5 ou 10 milliards)."
+)
+INITIAL_PRICE = st.sidebar.number_input(
+    "Initial Price (USD)", value=0.008, step=0.001, format="%.4f",
+    help="Prix de listing à TGE (USD par token)."
+)
+INIT_CIRC_PCT = st.sidebar.slider(
+    "Initial Circulating % (listing)", 0.0, 100.0, 12.2, 0.1,
+    help="Pourcentage de l’offre totale déjà en circulation au listing (incl. TGE + allocations initiales)."
+)
+DAYS = st.sidebar.number_input(
+    "Horizon (days)", value=730, min_value=180, step=30,
+    help="Durée de simulation en jours (ex. 730 ≈ 24 mois)."
+)
 
-def ema(series, span=14):
-    return pd.Series(series).ewm(span=span, adjust=False).mean().to_numpy()
+# ===================== Price regimes (GBM) =====================================
+st.sidebar.header("GBM (base regime)")
+MU_BASE    = st.sidebar.number_input(
+    "μ_base (annualized)", value=0.25, step=0.01,
+    help="Drift annualisé du prix (régime normal) utilisé dans le GBM."
+)
+SIGMA_BASE = st.sidebar.number_input(
+    "σ_base (annualized)", value=0.60, step=0.01,
+    help="Volatilité annualisée (régime normal) utilisée dans le GBM."
+)
 
-def dao_cap_policy_from_series(cap_target_series, cadence_days=14, trigger_pct=0.05,
-                               max_step_pct=0.10, cap_floor=1.0, cap_ceil=100.0):
+st.sidebar.header("Overflow Stress Window")
+OVERFLOW_WINDOW_DAYS = st.sidebar.number_input(
+    "Window length (days)", value=14, min_value=1, step=1,
+    help="Durée (en jours) d’un épisode de stress déclenché par un overflow."
+)
+MU_OVERFLOW = st.sidebar.number_input(
+    "μ_overflow (annualized)", value=-0.20, step=0.05,
+    help="Drift annualisé appliqué pendant les fenêtres d’overflow."
+)
+SIGMA_MULT_OVERFLOW = st.sidebar.number_input(
+    "σ multiplier (overflow)", value=1.5, step=0.1,
+    help="Multiplicateur appliqué à σ_base pendant un overflow."
+)
+
+st.sidebar.header("Bear-Market Windows (optional)")
+BEAR_INPUT = st.sidebar.text_area(
+    "Bear windows [(start,end, mu, sigma_mult), ...]", value="",
+    help="Liste d’intervalles où l’on impose un régime baissier spécifique. "
+         "Exemple : [(60,180,-0.35,1.3)] = du jour 60 au 180, μ=-0.35 et σ=1.3×σ_base."
+)
+try:
+    BEAR_WINDOWS = eval(BEAR_INPUT) if BEAR_INPUT.strip() else []
+    if not isinstance(BEAR_WINDOWS, list):
+        raise ValueError
+except Exception:
+    st.sidebar.error("Invalid bear windows. Example: [(60,180,-0.35,1.3)]")
+    BEAR_WINDOWS = []
+
+# ===================== Liquidity (absorber) ====================================
+st.sidebar.header("Dynamic Liquidity (absorber)")
+INITIAL_DEPOSIT = st.sidebar.number_input(
+    "Initial Liquidity Deposit (USD)", value=500_000, step=100_000,
+    help="Dépôt de liquidité initial (absorbeur n°1)."
+)
+LIQ_WINDOWS_STR = st.sidebar.text_area(
+    "Dyn. Liquidity Windows  [(start_day,end_day,USD), ...]",
+    value="[(30, 540, 1_000_000)]",
+    help="Fenêtres de liquidité dynamique. La somme (USD) est répartie uniformément entre start_day et end_day inclus."
+)
+try:
+    LIQ_WINDOWS = eval(LIQ_WINDOWS_STR) if LIQ_WINDOWS_STR.strip() else []
+    if not isinstance(LIQ_WINDOWS, list):
+        raise ValueError
+except Exception:
+    st.sidebar.error("Invalid format. Example: [(30,540,1_000_000)].")
+    LIQ_WINDOWS = []
+
+# ===================== Buybacks from revenues ==================================
+st.sidebar.header("Buybacks from Revenues")
+st.sidebar.caption("Les buybacks sont un absorbeur séparé de la liquidité dynamique.")
+START_YEAR = st.sidebar.number_input(
+    "Simulation start year", value=2026, step=1,
+    help="Année de départ de la table de revenus."
+)
+DEFAULT_BUYBACK_PCT = st.sidebar.slider(
+    "Default Buyback % of revenues", 0.0, 100.0, 5.0, 0.5,
+    help="Pourcentage des revenus alloué aux rachats (hors fenêtres spécifiques)."
+)/100.0
+FX_EURUSD = st.sidebar.number_input(
+    "EUR→USD FX", value=1.08, step=0.01,
+    help="Taux de conversion EUR→USD appliqué aux revenus."
+)
+
+st.sidebar.subheader("Buyback Windows (manual triggers)")
+st.sidebar.caption("Format: [(start_day,end_day,pct), ...]. Remplace le pourcentage par défaut sur ces périodes.")
+BUYBACK_WINDOWS_STR = st.sidebar.text_area(
+    "[(start_day,end_day,pct), ...]", value="",
+    help="Fenêtres de rachat manuelles (pct exprimé en fraction : 0.05 = 5%)."
+)
+try:
+    BUYBACK_WINDOWS = eval(BUYBACK_WINDOWS_STR) if BUYBACK_WINDOWS_STR.strip() else []
+    if not isinstance(BUYBACK_WINDOWS, list):
+        raise ValueError
+except Exception:
+    st.sidebar.error("Invalid buyback windows. Example: [(0,364,0.05),(365,729,0.10)]")
+    BUYBACK_WINDOWS = []
+
+# ---------------- Revenues table (editable) ------------------------------------
+st.write("#### Annual Revenues (editable) → daily buybacks")
+st.caption(
+    "Conversion EU/USA/UAE (EUR) en USD/jour **progressifs et continus** : "
+    "• Année 1 part de 0/jour et monte linéairement. "
+    "• Années suivantes **démarrent au niveau de fin** de l’année précédente. "
+    "Pour chaque année, la **somme des 365 jours = total annuel** (ancres respectées)."
+)
+
+rev_cols = ["Year", "EU (EUR)", "USA (EUR)", "UAE (EUR)"]
+rev_data = [
+    [2026, 1_101_901, 1_204_340, 1_483_958],
+    [2027, 5_748_490, 7_530_284, 4_465_492],
+    [2028,14_874_143,24_770_906,13_195_069],
+    [2029,32_946_569,58_193_436,38_317_697],
+    [2030,74_523_115,138_192_454,111_699_153],
+]
+_rev_df = pd.DataFrame(rev_data, columns=rev_cols)
+if _HAS_COLCONF:
+    rev_df = st.data_editor(
+        _rev_df, use_container_width=True, num_rows="dynamic",
+        column_config={
+            "Year": cc.NumberColumn("Year", help="Année fiscale (AAAA)."),
+            "EU (EUR)": cc.NumberColumn("EU (EUR)", help="Revenus annuels Union Européenne en EUR."),
+            "USA (EUR)": cc.NumberColumn("USA (EUR)", help="Revenus annuels USA en EUR."),
+            "UAE (EUR)": cc.NumberColumn("UAE (EUR)", help="Revenus annuels EAU en EUR."),
+        },
+    )
+else:
+    st.caption("Tip: for column tooltips, use Streamlit ≥ 1.25.")
+    rev_df = st.data_editor(_rev_df, use_container_width=True)
+
+# >>>>>>>>>>>>>>> NEW: revenues progressifs ET CONTINUS par année <<<<<<<<<<<<<<<
+def build_daily_revenue_usd_progressive_continuous(
+    T: int, start_year: int, df_rev: pd.DataFrame, eurusd: float
+) -> np.ndarray:
     """
-    Stepwise per-user cap (MRT$) updated at a fixed governance cadence.
-    Only changes if the instantaneous target cap moved >= trigger_pct from the last anchor.
-    Changes are limited to max_step_pct per decision and then clipped to [floor, ceil].
+    Série quotidienne des revenus en USD, continue d'une année à l'autre.
+    Année 1 : part de 0 et grimpe linéairement.
+    Année n>1 : démarre à la valeur de fin de l'année n-1 (continuité),
+    puis grimpe linéairement. Pour D=365, si A est le total annuel en USD,
+    et r_start la valeur journalière du 1er janvier :
+        r_end = 2*A/D - r_start
+    On interpole sur D jours : r(d) = r_start + (r_end - r_start) * d/(D-1).
+    La somme discrète vaut ~ D*(r_start + r_end)/2 = A (exacte avec D constant).
     """
-    cap = np.zeros_like(cap_target_series, dtype=float)
-    anchor = float(cap_target_series[0])
-    cap_val = float(np.clip(cap_target_series[0], cap_floor, cap_ceil))
-    for t in range(len(cap_target_series)):
-        if t > 0 and t % cadence_days == 0:
-            if anchor > 0 and abs(cap_target_series[t] - anchor) / anchor >= trigger_pct:
-                desired = float(np.clip(cap_target_series[t], cap_floor, cap_ceil))
-                delta = desired - cap_val
-                step = math.copysign(min(abs(delta), max_step_pct * max(cap_val, 1e-9)), delta)
-                cap_val += step
-                anchor = float(cap_target_series[t])
-        cap_val = float(np.clip(cap_val, cap_floor, cap_ceil))
-        cap[t] = cap_val
-    return cap
+    daily = np.zeros(T, dtype=float)
+    if df_rev.empty:
+        return daily
 
-def simulate_pool(total_pool, monthly_rate, monthly_injection):
-    """Return pool balance over time given per-month rate and per-month token injections."""
-    bal = np.zeros_like(monthly_rate, dtype=float)
-    x = float(total_pool)
-    for i in range(len(monthly_rate)):
-        emitted = x * monthly_rate[i]
-        x = x - emitted + (monthly_injection[i] if i < len(monthly_injection) else 0.0)
-        bal[i] = x
-    return bal
+    df_sorted = df_rev.sort_values("Year")
+    years = [int(y) for y in df_sorted["Year"].tolist() if int(y) >= start_year]
+    if not years:
+        return daily
 
-def normalize_weights(weights):
-    s = sum(weights)
-    if s <= 0:
-        return [1/len(weights)] * len(weights)
-    return [w/s for w in weights]
+    r_start_next = 0.0  # année 1 démarre à 0/jour
 
-def ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct):
-    """Search alpha for a power-law ladder matching cumulative targets at 0.5% and 1.0%."""
-    edges = np.linspace(depth_min, depth_max, n_slices + 1)
-    mids  = 0.5 * (edges[1:] + edges[:-1])
-    alphas = np.linspace(-1.5, 3.0, 1001)
-    best_err, best_alpha = None, None
-    for a in alphas:
-        raw = np.power(mids, -a)
-        w = raw / raw.sum()
-        dollars = w * total_at_2pct
-        def cum(thr): return dollars[mids <= thr].sum()
-        err = (cum(0.5) - targets[0.5])**2 + (cum(1.0) - targets[1.0])**2
-        if best_err is None or err < best_err:
-            best_err, best_alpha = err, a
-    return float(best_alpha)
+    for year in years:
+        idx_start = (year - start_year) * 365
+        idx_end   = idx_start + 365
+        if idx_start >= T:
+            break
 
-def gbm_price_path(days, p0=1.0, mu=0.0, sigma=0.2, seed=42):
-    """Daily geometric Brownian motion: dP/P = mu*dt + sigma*sqrt(dt)*dW with dt=1/252."""
+        row = df_sorted[df_sorted["Year"] == year].iloc[0]
+        total_eur = float(row["EU (EUR)"] + row["USA (EUR)"] + row["UAE (EUR)"])
+        total_usd = total_eur * float(eurusd)
+
+        D = 365
+        r_start = float(r_start_next)
+        r_end   = (2.0 * total_usd) / D - r_start  # garantit l'aire annuelle = total_usd
+
+        # sécurité minimale : si jamais r_end < 0 (rare si revenus croissent), on écrase à 0
+        # et on met un profil plat = total_usd/D pour éviter des valeurs négatives.
+        if r_end < 0:
+            r_start = 0.0
+            r_end   = (2.0 * total_usd) / D
+
+        days_here = max(0, min(idx_end, T) - idx_start)
+        if days_here <= 0:
+            r_start_next = r_end
+            continue
+
+        if D > 1:
+            for d in range(days_here):
+                x = d / (D - 1)
+                rate = r_start + (r_end - r_start) * x
+                daily[idx_start + d] += max(rate, 0.0)
+        else:
+            daily[idx_start] += total_usd
+
+        # continuité pour l'année suivante
+        r_start_next = r_end
+
+    return daily
+
+def apply_buyback_windows(revenue_daily_usd: np.ndarray, default_pct: float, windows: list, T: int) -> np.ndarray:
+    """% par défaut partout, remplacé sur les fenêtres [(start,end,pct), ...]."""
+    buyback = revenue_daily_usd * float(default_pct)
+    for (s, e, pct) in windows:
+        s = max(int(s), 0); e = min(int(e), T-1)
+        if e >= s:
+            buyback[s:e+1] = revenue_daily_usd[s:e+1] * float(pct)
+    return buyback
+
+# ====== Revenus journaliers progressifs & continus, puis buybacks =====
+revenue_daily_usd = build_daily_revenue_usd_progressive_continuous(
+    int(DAYS), START_YEAR, rev_df, FX_EURUSD
+)
+buyback_daily     = apply_buyback_windows(revenue_daily_usd, DEFAULT_BUYBACK_PCT, BUYBACK_WINDOWS, int(DAYS))
+
+# ===================== Static depth (Flowdesk calibration) ======================
+st.sidebar.header("Static Depth (Flowdesk calibration)")
+st.sidebar.caption("La static depth est un SEUIL (non-absorbant) ajusté par loi de puissance MC→Depth@2%.")
+MC_points_str    = st.sidebar.text_input(
+    "MC points (USD)",    "44e6, 68e6, 92e6, 116e6",
+    help="Points de calibration Market Cap en USD, séparés par des virgules."
+)
+Depth_points_str = st.sidebar.text_input(
+    "Depth@2% (USD)",     "0.9e6, 1.3e6, 1.8e6, 2.3e6",
+    help="Profondeur à ±2% correspondante (USD), séparée par des virgules."
+)
+try:
+    MC_points    = np.array([float(x) for x in MC_points_str.split(",")])
+    Depth_points = np.array([float(x) for x in Depth_points_str.split(",")])
+    assert len(MC_points) == len(Depth_points) and len(MC_points) >= 2
+except Exception:
+    st.sidebar.error("Bad calibration points; using defaults.")
+    MC_points    = np.array([44e6, 68e6, 92e6, 116e6])
+    Depth_points = np.array([0.9e6, 1.3e6, 1.8e6, 2.3e6])
+
+coeffs    = np.polyfit(np.log(MC_points), np.log(Depth_points), 1)
+beta_fit  = float(coeffs[0])
+k_fit     = float(np.exp(coeffs[1]))
+def static_depth(market_cap_usd: float) -> float:
+    return float(k_fit * (max(market_cap_usd, 0.0) ** beta_fit))
+
+# ===================== Allocations (blue-sheet style) ===========================
+st.write("#### Allocations & Triggering (blue-sheet style, editable)")
+alloc_cols = [
+    "Category","Alloc %","TGE %","Lockup (mo)","Vesting (mo)","Entry Price",
+    "Default SP %","Triggered SP %","Trigger ROI %","Sellable?"
+]
+alloc_preset = [
+    ["Team",                 10.0,  0.0, 12, 36, 0.0000,   5.0, 50.0, 100.0, False],
+    ["Advisors",              1.0,  0.0,  3,  9, 0.0000,  10.0, 60.0, 100.0, False],
+    ["Private 1 (Nexera)",    0.6, 10.0,  1, 11, 0.0015,  20.0, 95.0, 110.0, True ],
+    ["Private 2 (F&F)",       8.0,  5.0,  1, 11, 0.0023,  20.0, 95.0, 110.0, True ],
+    ["Seed",                  6.0,  9.1,  0, 23, 0.0033,  20.0, 90.0, 110.0, True ],
+    ["Institutionals (A)",    8.0,  1.8,  0, 23, 0.0045,  25.0, 90.0, 100.0, True ],
+    ["ICO#1",                 1.0, 25.0,  1,  9, 0.0050,  40.0, 90.0,  90.0, True ],
+    ["Airdrop",               1.0, 20.0,  1,  5, 0.0000,  50.0, 95.0, 100.0, True ],
+    ["Rewards Conversation", 20.0,  1.8,  0,120, 0.0000,  30.0, 70.0,  80.0, True ],
+    ["Rewards Staking",      10.0,  1.8,  0, 60, 0.0000,  20.0, 60.0,  80.0, True ],
+    ["Liquidity (CEX/DEX)",  10.0,  1.7,  0,  0, 0.0080,   0.0,  0.0,   0.0, False],
+    ["Ecosystem + Marketing",15.0,  1.7,  0, 60, 0.0000,  15.0, 60.0,  90.0, True ],
+    ["Foundation (DAO)",      5.0,100.0,  0,  0, 0.0000,   0.0,  0.0,   0.0, False],
+]
+_alloc_df = pd.DataFrame(alloc_preset, columns=alloc_cols)
+if _HAS_COLCONF:
+    df = st.data_editor(
+        _alloc_df, use_container_width=True, num_rows="dynamic",
+        column_config={
+            "Category": cc.TextColumn("Category", help="Nom de l’allocation/pool."),
+            "Alloc %": cc.NumberColumn("Alloc %", help="% de l’offre totale attribué à ce pool."),
+            "TGE %": cc.NumberColumn("TGE %", help="% de ce pool débloqué au TGE (jour 0)."),
+            "Lockup (mo)": cc.NumberColumn("Lockup (mo)", help="Période de lock (mois) avant le début du vesting."),
+            "Vesting (mo)": cc.NumberColumn("Vesting (mo)", help="Durée de vesting linéaire (mois) après lock."),
+            "Entry Price": cc.NumberColumn("Entry Price", help="Prix d’entrée / coût par token pour ce pool, si pertinent."),
+            "Default SP %": cc.NumberColumn("Default SP %", help="% vendable des unlocks (sell pressure) en régime normal."),
+            "Triggered SP %": cc.NumberColumn("Triggered SP %", help="% vendable si ROI déclenche le mode ‘triggered’."),
+            "Trigger ROI %": cc.NumberColumn("Trigger ROI %", help="Seuil de ROI (%) qui active la colonne ‘Triggered SP %’."),
+            "Sellable?": cc.CheckboxColumn("Sellable?", help="Ce pool génère-t-il de la pression vendeuse ?"),
+        },
+    )
+else:
+    df = st.data_editor(_alloc_df, use_container_width=True)
+
+# ===================== Build unlocks & circulating ==============================
+T = int(DAYS)
+t = np.arange(T)
+C = len(df)
+
+unlocked = np.zeros((C, T), dtype=float)
+for i, row in df.iterrows():
+    alloc_tokens = float(row["Alloc %"])/100.0 * TOTAL_SUPPLY
+    tge         = float(row["TGE %"])/100.0
+    lock_days   = int(row["Lockup (mo)"]) * 30
+    vest_days   = int(row["Vesting (mo)"]) * 30
+    if tge > 0:
+        unlocked[i, 0] += alloc_tokens * tge
+    if vest_days > 0:
+        daily = (alloc_tokens * (1.0 - tge)) / vest_days
+        start, end = lock_days, min(T, lock_days + vest_days)
+        if end > start:
+            unlocked[i, start:end] += daily
+
+sellable = df["Sellable?"].astype(bool).to_numpy()
+entry    = df["Entry Price"].astype(float).to_numpy()
+d_sp     = (df["Default SP %"].astype(float).to_numpy())/100.0
+t_sp     = (df["Triggered SP %"].astype(float).to_numpy())/100.0
+thr      =  df["Trigger ROI %"].astype(float).to_numpy()
+
+circ = np.zeros(T)
+circ[0] = (INIT_CIRC_PCT/100.0) * TOTAL_SUPPLY + unlocked[:, 0].sum()
+for d in range(1, T):
+    circ[d] = circ[d-1] + unlocked[:, d].sum()
+
+# ===================== One simulation (split absorption) =======================
+def run_one(seed: int):
     rng = np.random.default_rng(seed)
-    dt = 1/252
-    shocks = rng.normal(0, 1, size=days)
-    ret = (mu * dt) + (sigma * np.sqrt(dt) * shocks)
-    logP = np.log(p0) + np.cumsum(ret)
-    return np.exp(logP)
+    price = np.zeros(T); price[0] = INITIAL_PRICE
 
-def monthly_from_daily(series_daily, months, days_per_month=30, how="sum"):
-    """Aggregate a daily series into months of 30 days."""
-    arr = np.asarray(series_daily, dtype=float)
-    out = []
-    ptr = 0
-    for _ in range(months):
-        chunk = arr[ptr:ptr+days_per_month]
-        out.append(chunk.sum() if how == "sum" else chunk.mean())
-        ptr += days_per_month
-    return np.array(out)
+    queue_tokens_by_cat = np.zeros(C)  # leftovers queue
 
-# === New: 15y Yield Policy ===
-def build_yield_curve(months_total, policy_years, y_start_annual, y_end_annual, shape="Exponential", curvature=1.0):
-    """
-    Build an annual yield curve for the entire horizon:
-      • For t ∈ [0, policy_years], yield transitions from y_start_annual to y_end_annual
-      • For t > policy_years, yield stays flat at y_end_annual
-    Shapes:
-      - 'Linear':       r(t) = r0 + (rf - r0) * (t/T)
-      - 'Exponential':  r(t) = r0 * (rf/r0)^(t/T)
-      - 'Smoothstep':   r(t) = r0 + (rf - r0) * s(x), s= 3x^2 - 2x^3  (optionally warped by x^curvature)
-    Returns:
-      monthly_rate (len = months_total), annual_rate (same length)
-    """
-    T = policy_years
-    t_months = np.arange(months_total)
-    t_years  = t_months / 12.0
-    x = np.clip(t_years / max(T, 1e-9), 0.0, 1.0)  # normalized progress in [0,1]
+    # Outputs
+    realized_usd_by_cat = np.zeros((C, T))
+    desired_usd         = np.zeros(T)
+    absorbed_liq_usd    = np.zeros(T)  # by dynamic liquidity
+    absorbed_bb_usd     = np.zeros(T)  # by buybacks
+    overflow_usd        = np.zeros(T)
+    static_depth_series = np.zeros(T)
+    dyn_liq_series      = np.zeros(T)  # dynamic liquidity line (no buybacks)
+    buyback_series      = np.zeros(T)  # buybacks per day (for plotting)
 
-    r0, rf = float(y_start_annual), float(y_end_annual)
-    if shape == "Linear":
-        r = r0 + (rf - r0) * x
-    elif shape == "Exponential":
-        # geometric interpolation: exact endpoints if r0,rf>0
-        rf_safe = max(rf, 1e-9)
-        r0_safe = max(r0, 1e-9)
-        r = r0_safe * np.power(rf_safe / r0_safe, x)
-    else:  # Smoothstep (with optional curvature warp)
-        xw = np.power(x, max(curvature, 1e-6))
-        s  = 3*xw**2 - 2*xw**3
-        r  = r0 + (rf - r0) * s
+    overflow_days_left = 0
 
-    # Post-policy: hold flat at rf
-    r = np.where(t_years <= T, r, rf)
+    for day in range(T):
+        p  = price[day-1] if day > 0 else price[0]
+        mc = p * circ[day]
 
-    annual_rate  = r
-    monthly_rate = annual_rate / 12.0
-    return monthly_rate, annual_rate
+        # (1) Static depth (threshold, not absorber)
+        depth_s = static_depth(mc)
+        static_depth_series[day] = depth_s
 
-# ============================ TITLE ============================
+        # (2) Dynamic liquidity (absorber) — deposit + windows (NO buybacks here)
+        Ldyn_liq = 0.0
+        if day == 0:
+            Ldyn_liq += INITIAL_DEPOSIT
+        for (s, e, usd) in LIQ_WINDOWS:
+            if int(s) <= day <= int(e):
+                Ldyn_liq += float(usd)
+        dyn_liq_series[day] = Ldyn_liq
 
-st.title("MGTN$ Economy Calibrator — v7 (15-year Yield Policy)")
-st.caption("This version lets you set a 15-year start/end emission yield, choose a curve shape, and keeps yields flat after year 15.")
+        # (2b) Buybacks (absorber) — separate component
+        Ldyn_bb = float(buyback_daily[day])
+        buyback_series[day] = Ldyn_bb
 
-# ============================ SIDEBAR INPUTS ============================
+        # (3) Triggering → push to queue (ROI safe; only sellable pools)
+        Cn = len(entry)
+        roi = np.full(Cn, -np.inf, dtype=float)
+        valid = (entry > 0.0) & sellable
+        roi[valid] = (p / entry[valid] - 1.0) * 100.0
 
-st.sidebar.header("Supply Pools")
-primary_pool = st.sidebar.number_input(
-    "Primary Pool size (MGTN$)",
-    value=10_000_000_000, step=100_000_000,
-    help="Supply available for MRT$→MGTN$ conversions (primary swap / bonding curve)."
-)
-reward_pool  = st.sidebar.number_input(
-    "Reward Pool size (MGTN$)",
-    value=3_000_000_000, step=50_000_000,
-    help="Pool distributed to holders as rewards. Depletes per the yield curve; replenished by buybacks."
-)
+        sp_today = np.where(roi > thr, t_sp, d_sp)
+        sp_today = np.where(sellable, sp_today, 0.0)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Yield Policy (Emission Rate)")
-policy_years = st.sidebar.number_input(
-    "Policy window (years)", value=15, min_value=1, max_value=20, step=1,
-    help="Length of the current monetary policy. After this window, the yield stays at the end value."
-)
-y0 = st.sidebar.slider(
-    "Start annual yield r₀ (%)", min_value=0.0, max_value=40.0, value=15.0, step=0.5,
-    help="Annual emission rate at the start of the policy (year 0)."
-) / 100.0
-yT = st.sidebar.slider(
-    "End annual yield r_T at year 15 (%)", min_value=0.0, max_value=20.0, value=2.0, step=0.5,
-    help="Annual emission rate at the end of the 15-year policy window."
-) / 100.0
-shape = st.sidebar.selectbox(
-    "Yield curve shape",
-    ["Exponential", "Linear", "Smoothstep"],
-    index=0,
-    help="How to interpolate between start and end yields during the policy window."
-)
-curvature = st.sidebar.slider(
-    "Smoothness / Curvature (Smoothstep only)",
-    min_value=0.5, max_value=3.0, value=1.0, step=0.1,
-    help="Exponent that warps time in Smoothstep (x^k before the 3x^2−2x^3 easing). Ignored for Linear/Exponential."
-)
+        to_queue = unlocked[:, day] * sp_today
+        queue_tokens_by_cat += to_queue
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Horizon & Price Model")
-months_total = st.sidebar.slider(
-    "Total simulation horizon (months)", 12, 240, int(15*12), step=12,
-    help="Number of months simulated. After Year 15, the yield is held constant at the end value."
-)
-p0 = st.sidebar.number_input("Initial price (USD/MGTN$)", value=1.00, step=0.05, format="%.2f",
-                             help="Starting price for the GBM price path.")
-mu = st.sidebar.slider("Annual drift μ (%)", -50, 50, 0, step=1,
-                       help="Expected annualized return of price (GBM).") / 100.0
-sigma = st.sidebar.slider("Annual volatility σ (%)", 1, 200, 60, step=1,
-                          help="Annualized volatility of price (GBM).") / 100.0
-price_seed = st.sidebar.number_input("Random seed (price)", value=42, step=1,
-                                     help="Seed for reproducible price paths.")
-price_ref_for_cap = st.sidebar.selectbox("Price reference for DAO cap",
-                                         ["EMA14d price", "Last price"], index=0,
-                                         help="Which price series is used to translate USD depth into a per-user cap.")
+        # (4) Desired → Absorb split (liquidity first, then buybacks)
+        queue_total = float(queue_tokens_by_cat.sum())
+        desired = queue_total * p
+        desired_usd[day] = desired
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Revenue Sharing → Buybacks")
-buyback_pct = st.sidebar.slider("Buyback rate (% of revenues)", 0, 50, 5,
-                                help="Share of monthly revenues converted to MGTN$ by the MM.") / 100.0
-buyback_cadence = st.sidebar.slider("Buyback cadence (days)", 1, 90, 30, step=1,
-                                    help="How often the MM executes buybacks. USD accrues daily and converts at the execution price.")
+        # First absorb with dynamic liquidity
+        abs_liq = min(desired, Ldyn_liq)
+        residual_after_liq = desired - abs_liq
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Market Depth (Kaiko) & Buildings")
-k_ratio = st.sidebar.number_input("k (scaling)", value=1450, step=50,
-                                  help="Scaling factor in D₂%(u) = k × u^β for ±2% depth, in USD.")
-beta = st.sidebar.slider("β (sublinear exponent)", 0.1, 1.0, 0.6, 0.05,
-                         help="Sublinear exponent for depth growth vs users.")
-users_per_building = st.sidebar.slider("Users per building", 1, 10, 3,
-                                       help="Map buildings to users: users = buildings × this value.")
-max_buildings = st.sidebar.slider("Max buildings (x-axis range)", 100, 20000, 5000, step=100,
-                                  help="Upper x-axis bound for buildings plots.")
-d05 = st.sidebar.number_input("±0.5% depth (%)", value=4.0, step=0.5,
-                              help="Cumulative depth within ±0.5% of mid, as % of per-CEX allocation.") / 100.0
-d10 = st.sidebar.number_input("±1.0% depth (%)", value=12.0, step=0.5,
-                              help="Cumulative depth within ±1.0% of mid, as % of per-CEX allocation.") / 100.0
-d20 = st.sidebar.number_input("±2.0% depth (%)", value=36.0, step=0.5,
-                              help="Cumulative depth within ±2.0% of mid, as % of per-CEX allocation.") / 100.0
-cap_threshold = st.sidebar.radio("Cap is tied to which depth?", ["±1.0%", "±2.0%"], index=0,
-                                 help="Choose which depth threshold the DAO cap enforces against.")
+        # Then absorb with buybacks
+        abs_bb = min(residual_after_liq, Ldyn_bb)
+        residual = residual_after_liq - abs_bb
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("DAO Cap Policy")
-cadence = st.sidebar.slider("Governance cadence (days)", 7, 60, 14, step=1,
-                            help="How often the DAO can update the cap per user.")
-trigger = st.sidebar.slider("EMA trigger threshold (%)", 1, 25, 5, step=1,
-                            help="Min change vs last anchor to trigger cap update.") / 100.0
-max_step = st.sidebar.slider("Max cap step per decision (%)", 1, 50, 10, step=1,
-                             help="At each decision, cap can move by at most this % of current value.") / 100.0
-cap_floor = st.sidebar.number_input("Cap floor (MRT$ per user)", value=5.0, step=1.0,
-                                    help="Lower bound for per-user cap.")
-cap_ceil = st.sidebar.number_input("Cap ceiling (MRT$ per user)", value=60.0, step=5.0,
-                                   help="Upper bound for per-user cap.")
+        absorbed_liq_usd[day] = abs_liq
+        absorbed_bb_usd[day]  = abs_bb
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("MM Loan & CEX split")
-loan_amount = st.sidebar.number_input("MM loan amount (USD)", value=3_000_000, step=100_000,
-                                      help="USD loan deployed by MM across CEXs to meet depth targets.")
-st.sidebar.caption("Weights (auto-normalized)")
-w_binance = st.sidebar.slider("Binance weight", 0.0, 1.0, 0.40, 0.05, help="Share of MM loan allocated to Binance.")
-w_okx     = st.sidebar.slider("OKX weight",     0.0, 1.0, 0.25, 0.05, help="Share allocated to OKX.")
-w_coin    = st.sidebar.slider("Coinbase weight",0.0, 1.0, 0.20, 0.05, help="Share allocated to Coinbase.")
-w_bybit   = st.sidebar.slider("Bybit weight",   0.0, 1.0, 0.15, 0.05, help="Share allocated to Bybit.")
+        if residual > depth_s:
+            overflow_usd[day] = residual - depth_s
+            overflow_days_left = int(OVERFLOW_WINDOW_DAYS)
 
-st.sidebar.subheader("Power-law Ladder (Tier-1)")
-n_slices = st.sidebar.slider("Number of slices", 10, 60, 30, step=5,
-                             help="Number of depth buckets from min to max depth.")
-depth_min = st.sidebar.number_input("Min depth (%)", value=0.05,
-                                    help="Lower bound of ladder quoting range (from mid).")
-depth_max = st.sidebar.number_input("Max depth (%)", value=2.0,
-                                    help="Upper bound of ladder quoting range (from mid).")
+        # Execute tokens actually sold (abs_liq + abs_bb)
+        absorbed_total = abs_liq + abs_bb
+        tokens_to_sell = absorbed_total / max(p, 1e-12)
+        if queue_total > 0.0 and tokens_to_sell > 0.0:
+            ratio = tokens_to_sell / queue_total
+            exec_tokens = queue_tokens_by_cat * ratio
+            realized_usd_by_cat[:, day] = exec_tokens * p
+            queue_tokens_by_cat -= exec_tokens  # leftovers remain in queue
 
-# ============================ Revenues (editable) ============================
+        # (5) μ/σ of the day: bear > overflow > base
+        mu_eff, sigma_eff = MU_BASE, SIGMA_BASE
+        in_bear = False
+        for (bs, be, bmu, bmult) in BEAR_WINDOWS:
+            if int(bs) <= day <= int(be):
+                mu_eff    = float(bmu)
+                sigma_eff = SIGMA_BASE * float(bmult)
+                in_bear   = True
+                break
+        if not in_bear and overflow_days_left > 0:
+            mu_eff    = MU_OVERFLOW
+            sigma_eff = SIGMA_BASE * SIGMA_MULT_OVERFLOW
+            overflow_days_left -= 1
 
-st.markdown("### Revenues (editable)")
-st.caption("Annual USD revenues by region (2026–2030). Evenly distributed per month; extended at Year-5 level thereafter.")
-default_rev = pd.DataFrame({
-    "Region": ["EU", "USA", "UAE"],
-    "2026": [936_616, 1_023_689, 1_261_364],
-    "2027": [4_886_217, 6_400_741, 3_795_668],
-    "2028": [12_643_021, 21_055_270, 11_215_809],
-    "2029": [28_004_583, 49_464_421, 32_570_042],
-    "2030": [63_344_647, 117_463_586, 94_944_280],
-})
-rev_df = st.data_editor(default_rev, num_rows="dynamic", use_container_width=True)
-years_cols = [c for c in rev_df.columns if c != "Region"]
-annual_totals = rev_df[years_cols].sum().to_numpy()
-monthly_rev_5y = np.repeat(annual_totals / 12.0, 12)  # 60 months
-steady = monthly_rev_5y[-1] if len(monthly_rev_5y) else 0.0
-monthly_revenue_series = np.concatenate([monthly_rev_5y,
-                                         np.full(max(0, months_total - len(monthly_rev_5y)), steady)])
+        # (6) GBM update
+        z = rng.normal()
+        price_next = p * np.exp((mu_eff - 0.5 * sigma_eff**2) * DT + sigma_eff * np.sqrt(DT) * z)
+        price[day] = max(price_next, 1e-12)
 
-# ============================ Price & Buybacks (Daily) ============================
+    return (price, realized_usd_by_cat, desired_usd, absorbed_liq_usd, absorbed_bb_usd,
+            overflow_usd, static_depth_series, dyn_liq_series, buyback_series)
 
-days_per_month = 30
-days = months_total * days_per_month
-price_path = gbm_price_path(days, p0=p0, mu=mu, sigma=sigma, seed=price_seed)
-price_ema = ema(price_path, span=14)
-price_ref_series = price_ema if (price_ref_for_cap == "EMA14d price") else price_path
+# ===================== Monte Carlo & aggregates =================================
+all_prices = np.zeros((T, N))
+sum_realized = np.zeros((C, T))
+sum_desired  = np.zeros(T)
+sum_abs_liq  = np.zeros(T)
+sum_abs_bb   = np.zeros(T)
+sum_overflow = np.zeros(T)
+static_depth_ref = None
+dyn_liq_ref      = None
+buyback_ref      = None
 
-# Daily buyback to tokens at cadence
-daily_usd_rev = np.repeat(monthly_revenue_series / days_per_month, days_per_month)
-daily_buyback_accum = 0.0
-daily_token_inj = np.zeros(days)
-for t in range(days):
-    daily_usd = daily_usd_rev[t] * buyback_pct
-    daily_buyback_accum += daily_usd
-    if t % buyback_cadence == 0:
-        tokens = daily_buyback_accum / max(price_path[t], 1e-9)
-        daily_token_inj[t] += tokens
-        daily_buyback_accum = 0.0
-if daily_buyback_accum > 0:
-    daily_token_inj[-1] += daily_buyback_accum / max(price_path[-1], 1e-9)
-monthly_injection_tokens = monthly_from_daily(daily_token_inj, months_total, days_per_month=days_per_month, how="sum")
+for n in range(N):
+    (p, realized, desired, a_liq, a_bb, overflow, depth_s, Ldyn_liq, Lbb) = run_one(42+n)
+    all_prices[:, n] = p
+    sum_realized += realized
+    sum_desired  += desired
+    sum_abs_liq  += a_liq
+    sum_abs_bb   += a_bb
+    sum_overflow += overflow
+    if static_depth_ref is None:
+        static_depth_ref = depth_s
+        dyn_liq_ref      = Ldyn_liq
+        buyback_ref      = Lbb
 
-# ============================ Reward Pool (Monthly, using 15y yield policy) ============================
+median_price = np.median(all_prices, axis=1)
+avg_realized = sum_realized / N
+avg_desired  = sum_desired  / N
+avg_abs_liq  = sum_abs_liq  / N
+avg_abs_bb   = sum_abs_bb   / N
+avg_overflow = sum_overflow / N
 
-monthly_rate, annual_rate = build_yield_curve(
-    months_total=months_total,
-    policy_years=policy_years,
-    y_start_annual=y0,
-    y_end_annual=yT,
-    shape=shape,
-    curvature=curvature
-)
+# ===================== Graph 1: Realized by category + price ====================
+st.write("### Graph 1 — Realized (absorbed) by Category vs Median Price")
+st.caption("Realized = exécutions via **Dynamic Liquidity + Buybacks** (la décomposition est visible dans le Graph 2).")
+use_log = st.checkbox("Log-scale for USD/day axis (Graph 1)", value=False, help="Active un axe Y logarithmique pour mieux lire les pics.")
+clip_99 = st.checkbox("Clip left axis at 99th percentile (reduce spikes)", value=True, help="Coupe l’axe gauche au 99e percentile pour réduire l’effet des spikes.")
+smooth_left = st.checkbox("Smooth stacked sum (display only)", value=True, help="Lisse la somme empilée (affichage uniquement).")
 
-bal_with_rev = simulate_pool(reward_pool, monthly_rate, monthly_injection_tokens)
-bal_no_rev   = simulate_pool(reward_pool, monthly_rate, np.zeros_like(monthly_injection_tokens))
+sum_realized_series = avg_realized.sum(axis=0)
+sum_realized_series_disp = uniform_filter1d(sum_realized_series, size=7, mode="nearest") if smooth_left else sum_realized_series
 
-# ============================ DAO Cap Impact (Daily) ============================
+fig1, ax1 = plt.subplots(figsize=(13, 6))
+ax1.stackplot(t, avg_realized, labels=[str(x) for x in df["Category"]], alpha=0.65)
+ax1.set_xlabel("Day")
+ax1.set_ylabel("Realized Sells (USD/day)")
+if use_log:
+    ax1.set_yscale("log")
+if clip_99 and not use_log:
+    y_top = float(np.percentile(sum_realized_series_disp, 99) * 1.15)
+    ax1.set_ylim(0, max(1.0, y_top))
+ax1.legend(loc="upper left", ncol=2, fontsize=8)
 
-# Example buildings trajectory (linear-in-time proxy here; replace with your curve if needed)
-b_series = np.linspace(max_buildings * 0.2, max_buildings * 0.6, days)
-u_series = b_series * users_per_building
-d2_daily = kaiko_depth(u_series, k_ratio, beta)
-ratio_choice = "1.0" if cap_threshold == "±1.0%" else "2.0"
-r10 = d10 / d20
-depth_target_daily = d2_daily * (r10 if ratio_choice == "1.0" else 1.0)
-depth_ema_daily = ema(depth_target_daily, span=14)
+ax2 = ax1.twinx()
+ax2.plot(t, median_price, linewidth=2, label="Median Price (100 sims)")
+ax2.set_ylabel("Token Price (USD)")
+ax2.legend(loc="upper right")
+ax1.set_title("Realized Sales by Category vs Median Price (Overflow windows on μ/σ)")
+st.pyplot(fig1)
 
-cap_target_per_user = cap_per_user_from_depth(depth_ema_daily, u_series, price_ref_series, cap_floor, cap_ceil)
-cap_per_user_policy = dao_cap_policy_from_series(
-    cap_target_per_user, cadence_days=cadence, trigger_pct=trigger,
-    max_step_pct=max_step, cap_floor=cap_floor, cap_ceil=cap_ceil
-)
-allowed_total_usd = cap_per_user_policy * u_series * price_ref_series  # max aggregate in USD at the cap
+# ===================== Graph 2: Desired vs Absorption split vs Overflow =========
+st.write("### Graph 2 — Desired vs Absorbed (split: Liquidity vs Buybacks) vs Overflow + Depth")
+fig2, ax = plt.subplots(figsize=(14, 6))
 
-# ============================ Navigation ============================
+# Desired (blue fill)
+ax.fill_between(t, 0, avg_desired, color="#cfe3ff", alpha=0.8, label="Desired sells (USD/day)")
 
-page = st.radio(
-    "Navigation",
-    ["Dashboard", "Price & Buybacks", "Revenues & Reward Pool", "DAO Cap Impact", "Depth vs Buildings", "MM & Ladder", "Downloads"],
-    horizontal=True,
-    help="Switch between analysis pages."
-)
+# Absorption split (stack the two)
+ax.fill_between(t, 0, avg_abs_liq, color="#ffcf99", alpha=0.9, label="Absorbed by Dynamic Liquidity")
+ax.fill_between(t, avg_abs_liq, avg_abs_liq + avg_abs_bb, color="#ffa466", alpha=0.9, label="Absorbed by Buybacks")
 
-# ============================ Pages ============================
+# Threshold line (static depth)
+ax.plot(t, static_depth_ref, linestyle="--", color="#1b6ac9", linewidth=2.0,
+        label="Static Depth Threshold (Flowdesk-calibrated)")
 
-if page == "Dashboard":
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Primary Pool (MGTN$)", f"{primary_pool:,.0f}")
-    col2.metric("Reward Pool (MGTN$)", f"{reward_pool:,.0f}")
-    col3.metric("Yield: start → end",
-                f"{y0*100:.1f}% → {yT*100:.1f}%")
-    col4.metric("Policy window", f"{policy_years} years")
+# Dynamic Liquidity & Buyback lines (capacity cues)
+ax.plot(t, dyn_liq_ref, linestyle=":", color="#f39c12", linewidth=2, label="Dynamic Liquidity (absorber)")
+ax.plot(t, buyback_ref, linestyle=":", color="#d35400", linewidth=1.6, label="Buybacks (absorber)")
 
-    t_years = np.arange(months_total) / 12.0
-    st.markdown("#### Reward Pool Depletion (Price-aware buybacks)")
-    with st.expander("What am I looking at?"):
-        st.write("Balance of the Reward Pool with (solid) and without (dashed) buybacks. Emission uses your 15-year yield policy; after year 15, yield is flat.")
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    ax.plot(t_years, bal_no_rev / 1e9, "--", label="No revenue sharing")
-    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}%" )
-    ax.set_xlabel("Years"); ax.set_ylabel("Pool Balance (B MGTN$)"); ax.grid(alpha=0.2); ax.legend(loc="upper right")
-    st.pyplot(fig, clear_figure=True)
+# Overflow hatch (only the part above depth)
+residual_avg = np.maximum(avg_desired - (avg_abs_liq + avg_abs_bb), 0.0)
+overflow_zone = np.maximum(residual_avg - static_depth_ref, 0.0)
+ax.fill_between(t, static_depth_ref, static_depth_ref + overflow_zone,
+                where=(overflow_zone > 0),
+                facecolor="none", edgecolor="red", hatch="//", linewidth=0.0,
+                label="Overflow (triggers μ/σ)")
 
-    st.markdown("#### DAO Cap vs Depth Headroom (Price-aware)")
-    with st.expander("What does the DAO cap change?"):
-        st.write("Per-user cap = depth / (users × price). The DAO updates it infrequently (cadence/trigger/step), and floor/ceiling limit extremes.")
-    breach_days = int((depth_ema_daily - allowed_total_usd < 0).sum())
-    colA, colB, colC = st.columns(3)
-    colA.metric("Current price (USD)", f"{price_path[-1]:.3f}")
-    colB.metric("Cap per user now (MRT$)", f"{cap_per_user_policy[-1]:.2f}")
-    colC.metric("Days breaching depth", f"{breach_days} / {days}")
+ax.set_xlabel("Day")
+ax.set_ylabel("USD/day")
+ax.legend(loc="upper left", ncol=2)
+ax.set_title("Desired vs Absorbed vs Overflow — StaticDepth is a threshold (not an absorber)")
+st.pyplot(fig2)
 
-    fig2, ax = plt.subplots(figsize=(8, 3.5))
-    ax.plot(depth_ema_daily, label="Depth target (EMA, USD)")
-    ax.plot(allowed_total_usd, label="Max allowed @ DAO cap (USD)")
-    ax.fill_between(np.arange(days), allowed_total_usd, depth_ema_daily,
-                    where=(depth_ema_daily > allowed_total_usd), alpha=0.25, label="Headroom")
-    ax.set_xlabel("Day"); ax.set_ylabel("USD"); ax.grid(alpha=0.2); ax.legend()
-    st.pyplot(fig2, clear_figure=True)
+# ===================== Optional: Utilization ====================================
+if st.checkbox("Show Utilization (Residual / StaticDepth)", help="Affiche l’utilisation de la profondeur statique (Residual / StaticDepth). Overflow quand > 1."):
+    util = np.divide(residual_avg, np.maximum(static_depth_ref, 1e-9))
+    figU, axU = plt.subplots(figsize=(13, 4))
+    axU.plot(t, util, linewidth=2, label="Residual / StaticDepth")
+    axU.axhline(1.0, linestyle="--", linewidth=1, label="Overflow threshold")
+    util_top = max(1.1, min(5.0, float(np.nanmax(util)*1.1)))
+    axU.fill_between(t, 1.0, np.minimum(util, util_top), where=(util>1.0),
+                     alpha=0.25, step="pre", label="Overflow zone")
+    axU.set_ylim(0, util_top)
+    axU.set_xlabel("Day"); axU.set_ylabel("×")
+    axU.legend(loc="upper left")
+    axU.set_title("Depth Utilization — overflow when > 1")
+    st.pyplot(figU)
 
-elif page == "Price & Buybacks":
-    st.subheader("Price Path (GBM) and Buyback Cadence")
-    with st.expander("What am I looking at?"):
-        st.write("Daily price (GBM) with EMA14d overlay. Change μ, σ, seed, and cadence to see token injection timing.")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(price_path, label="Price (daily)")
-    ax.plot(price_ema, label="Price EMA14d")
-    ax.set_xlabel("Day"); ax.set_ylabel("USD/MGTN$"); ax.grid(alpha=0.2); ax.legend()
-    st.pyplot(fig, clear_figure=True)
+# ===================== Help (tooltips-style recap) ==============================
+with st.expander("🛈 What you’re seeing (quick glossary)"):
+    st.markdown("""
+- **Revenues (progressifs & continus)** : chaque année est une **rampe linéaire** dont le **départ = fin de l’année précédente**.
+  La **somme des 365 jours** égale exactement le **total annuel** fourni.
+- **Desired sells** = ce que les holders *veulent* vendre aujourd’hui (unlocks × règles SP par pool ; ROI trigger-safe).
+- **Absorbed by Dynamic Liquidity** = exécutions financées par la liquidité dynamique (incl. dépôt initial).
+- **Absorbed by Buybacks** = exécutions financées par le budget de rachat du jour (depuis revenus).
+- **Static Depth (Flowdesk)** = *seuil uniquement* (n’absorbe pas). Le résiduel au-dessus déclenche une fenêtre μ/σ de stress.
+""")
 
-    st.markdown("**Token injections from buybacks (execution days)**")
-    days_axis = np.arange(days)
-    fig2, ax = plt.subplots(figsize=(10, 3.5))
-    inj_mask = monthly_from_daily(daily_token_inj, months_total, how="sum")  # only to show it runs
-    ax.bar(days_axis[daily_token_inj>0], daily_token_inj[daily_token_inj>0], width=1.0, label="Token injection")
-    ax.set_xlabel("Day"); ax.set_ylabel("Tokens injected (MGTN$)"); ax.grid(alpha=0.2); ax.legend()
-    st.pyplot(fig2, clear_figure=True)
-
-elif page == "Revenues & Reward Pool":
-    st.subheader("Monthly Revenues by Region (USD) & Cumulative")
-    month_axis_5y = np.arange(len(np.repeat(annual_totals / 12.0, 12)))
-    fig, ax = plt.subplots(figsize=(9, 4))
-    for idx, row in rev_df.iterrows():
-        series = np.repeat(row[years_cols].to_numpy() / 12.0, 12)
-        ax.plot(month_axis_5y, series, label=f"{row['Region']} (monthly)")
-    ax.set_xlabel("Months since Jan 2026"); ax.set_ylabel("USD"); ax.grid(alpha=0.2); ax.legend()
-    ax2 = ax.twinx()
-    stacked = np.sum([np.repeat(rev_df.iloc[i][years_cols].to_numpy()/12.0, 12) for i in range(len(rev_df))], axis=0)
-    ax2.plot(month_axis_5y, np.cumsum(stacked), color="black", linewidth=2, label="Cumulative")
-    ax2.set_ylabel("Cumulative (USD)")
-    st.pyplot(fig, clear_figure=True)
-
-    t_years = np.arange(months_total) / 12.0
-    st.subheader("Reward Pool Depletion (with/without buybacks)")
-    with st.expander("What am I looking at?"):
-        st.write("Reward Pool balance with and without buybacks. Right axis shows the annual yield used from your 15-year policy.")
-    fig2, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(t_years, bal_no_rev / 1e9, "--", label="No revenue sharing")
-    ax.plot(t_years, bal_with_rev / 1e9, label=f"Buybacks @ {int(buyback_pct*100)}%")
-    ax.set_xlabel("Years"); ax.set_ylabel("Pool Balance (B MGTN$)"); ax.grid(alpha=0.2); ax.legend(loc="upper right")
-    ax2 = ax.twinx()
-    ax2.plot(t_years, (annual_rate * 100)[:len(t_years)], alpha=0.65, label="Annual yield (%)")
-    ax2.set_ylabel("Annual Yield (%)")
-    st.pyplot(fig2, clear_figure=True)
-
-elif page == "DAO Cap Impact":
-    st.subheader("How the DAO Cap Uses Price")
-    st.caption("Per-user cap = depth target (USD) / (users × price reference). DAO cadence/trigger/step + floor/ceiling produce the stepwise policy.")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(cap_target_per_user, label="Instant target cap (MRT$/user)")
-    ax.step(np.arange(days), cap_per_user_policy, where="post", label="DAO cap policy (MRT$/user)")
-    ax.set_xlabel("Day"); ax.set_ylabel("MRT$ per user"); ax.grid(alpha=0.2); ax.legend()
-    st.pyplot(fig, clear_figure=True)
-
-    fig2, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(depth_ema_daily, label="Depth target (EMA, USD)")
-    ax.plot(allowed_total_usd, label="Max allowed @ DAO cap (USD)")
-    ax.fill_between(np.arange(days), allowed_total_usd, depth_ema_daily,
-                    where=(depth_ema_daily > allowed_total_usd), alpha=0.25, label="Headroom")
-    ax.set_xlabel("Day"); ax.set_ylabel("USD"); ax.grid(alpha=0.2); ax.legend()
-    st.pyplot(fig2, clear_figure=True)
-
-elif page == "Depth vs Buildings":
-    st.subheader("Depth Curves vs Buildings (monthly view)")
-    b = np.linspace(1, max_buildings, 200)
-    u = b * users_per_building
-    d2 = kaiko_depth(u, k_ratio, beta)
-    r05 = d05 / d20
-    r10 = d10 / d20
-    fig4, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(b, d2 * r05, label="Depth ±0.5%")
-    ax.plot(b, d2 * r10, label="Depth ±1.0%")
-    ax.plot(b, d2,       label="Depth ±2.0%")
-    ax.set_xlabel("Buildings"); ax.set_ylabel("Depth (USD)"); ax.grid(alpha=0.2); ax.legend(loc="upper left")
-    st.pyplot(fig4, clear_figure=True)
-
-elif page == "MM & Ladder":
-    st.subheader("MM Loan Split across CEXs")
-    names = ["Binance", "OKX", "Coinbase", "Bybit"]
-    weights = normalize_weights([w_binance, w_okx, w_coin, w_bybit])
-    alloc = [loan_amount * w for w in weights]
-    fig5, ax = plt.subplots(figsize=(9, 3.5))
-    ax.bar(names, alloc)
-    for i, val in enumerate(alloc):
-        ax.text(i, val, f"${val:,.0f}", ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("USD allocated"); ax.grid(axis="y", alpha=0.2)
-    st.pyplot(fig5, clear_figure=True)
-
-    st.subheader("Power-law Ladder Calibration (Tier-1)")
-    per_cex_alloc = alloc[0]
-    targets = {0.5: d05 * per_cex_alloc, 1.0: d10 * per_cex_alloc, 2.0: d20 * per_cex_alloc}
-    alpha = ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct=targets[2.0]) if per_cex_alloc>0 else 0.0
-
-    edges = np.linspace(depth_min, depth_max, n_slices + 1)
-    mids  = 0.5 * (edges[1:] + edges[:-1])
-    raw = np.power(mids, -alpha) if per_cex_alloc>0 else np.ones_like(mids)
-    w = raw / raw.sum() if raw.sum()>0 else np.ones_like(mids)/len(mids)
-    dollars = w * targets[2.0] if per_cex_alloc>0 else np.zeros_like(mids)
-
-    fig6, ax = plt.subplots(figsize=(9, 3.5))
-    ax.bar(mids, dollars, width=(edges[1] - edges[0]))
-    ax.set_xlabel("Depth (% from mid)"); ax.set_ylabel("USD per slice (both sides)")
-    ax.set_title(f"First CEX ladder (alpha = {alpha:.3f})"); ax.grid(alpha=0.2)
-    st.pyplot(fig6, clear_figure=True)
-
-    fig7, ax = plt.subplots(figsize=(9, 3.5))
-    sorted_m = np.sort(mids)
-    cum_curve = [dollars[mids <= t].sum() for t in sorted_m]
-    ax.plot(sorted_m, cum_curve, label="Achieved cumulative $")
-    for thr in [0.5, 1.0, 2.0]:
-        ax.axvline(thr, linestyle="--"); ax.axhline(targets[thr], linestyle="--")
-        ax.text(thr, targets[thr], f" {thr:.1f}% → ${targets[thr]:,.0f}", va="bottom", fontsize=9)
-    ax.set_xlabel("Depth threshold (%)"); ax.set_ylabel("Cumulative USD"); ax.legend(); ax.grid(alpha=0.2)
-    st.pyplot(fig7, clear_figure=True)
-
-elif page == "Downloads":
-    st.subheader("Downloads")
-    names = ["Binance", "OKX", "Coinbase", "Bybit"]
-    weights = normalize_weights([w_binance, w_okx, w_coin, w_bybit])
-    per_cex_alloc = (loan_amount * weights[0]) if len(weights) else 0.0
-    try:
-        targets = {0.5: d05 * per_cex_alloc, 1.0: d10 * per_cex_alloc, 2.0: d20 * per_cex_alloc}
-        alpha = ladder_alpha(depth_min, depth_max, n_slices, targets, total_at_2pct=targets[2.0]) if per_cex_alloc>0 else None
-    except Exception:
-        alpha = None
-
-    out_rev = pd.DataFrame({"Month": np.arange(len(monthly_revenue_series)) + 1,
-                            "Monthly_Revenue_USD": monthly_revenue_series})
-    st.download_button("Download monthly revenues CSV",
-                       data=out_rev.to_csv(index=False),
-                       file_name="monthly_revenues.csv",
-                       mime="text/csv")
-    out_params = {
-        "primary_pool": primary_pool,
-        "reward_pool": reward_pool,
-        "yield_policy": {"policy_years": policy_years, "y0": y0, "yT": yT, "shape": shape, "curvature": curvature},
-        "price": {"p0": p0, "mu": mu, "sigma": sigma, "seed": price_seed, "price_ref_for_cap": price_ref_for_cap,
-                  "buyback_cadence_days": buyback_cadence},
-        "buyback_pct": buyback_pct,
-        "horizon_months": months_total,
-        "kaiko": {"k_ratio": k_ratio, "beta": beta, "users_per_building": users_per_building},
-        "tier1_ratios": {"0.5%": d05, "1.0%": d10, "2.0%": d20, "cap_threshold": cap_threshold},
-        "dao_policy": {"cadence_days": cadence, "trigger_pct": trigger,
-                       "max_step_pct": max_step, "cap_floor": cap_floor, "cap_ceil": cap_ceil},
-        "mm": {"loan_amount": loan_amount,
-               "cex_weights": dict(zip(names, weights)),
-               "ladder": {"n_slices": int(n_slices), "depth_min": depth_min, "depth_max": depth_max,
-                          "alpha": float(alpha) if alpha is not None else None}}
-    }
-    st.download_button("Download current parameters (JSON)",
-                       data=json.dumps(out_params, indent=2),
-                       file_name="params.json",
-                       mime="application/json")
+# ===================== Raw Data (optional) ======================================
+if st.checkbox("Show Raw Data", help="Affiche un tableau avec les séries agrégées et les découpes par catégorie."):
+    out = pd.DataFrame({
+        "Day": t,
+        "Median Price": np.median(all_prices, axis=1),
+        "Desired USD/day": avg_desired,
+        "Absorbed by Liquidity USD/day": avg_abs_liq,
+        "Absorbed by Buybacks USD/day": avg_abs_bb,
+        "Residual USD/day": residual_avg,
+        "Overflow USD/day": avg_overflow,
+        "Static Depth (USD/day)": static_depth_ref,
+        "Dyn Liquidity capacity (USD/day)": dyn_liq_ref,
+        "Buyback capacity (USD/day)": buyback_ref,
+        "Revenue per day (USD)": revenue_daily_usd[:T],
+        "Circulating (tokens)": circ,
+    })
+    for i, name in enumerate(df["Category"]):
+        out[f"Realized USD — {name}"] = avg_realized[i]
+    st.dataframe(out, use_container_width=True)
